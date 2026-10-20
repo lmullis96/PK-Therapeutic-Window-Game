@@ -1,0 +1,471 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Therapeutic Window XR</title>
+  <style>
+    html, body { margin: 0; height: 100%; background: #0b1016; overflow: hidden; font-family: system-ui, sans-serif; }
+    #help {
+      position: absolute; top: 12px; left: 12px; color: #cfe3f1; font-size: 13px; line-height: 1.5;
+      background: rgba(10, 16, 24, 0.75); padding: 10px 12px; border-radius: 8px; max-width: 320px;
+    }
+    #help b { color: #fff; }
+  </style>
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.169.0/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.169.0/examples/jsm/"
+      }
+    }
+  </script>
+</head>
+<body>
+  <div id="help">
+    <b>Therapeutic Window</b><br />
+    Keep the patient's theophylline level between <b>10–20 mg/L</b>.<br />
+    Desktop: click the buttons, or press <b>Space</b> = start, <b>1/2/3</b> = 100/200/300 mg, <b>R</b> = restart.<br />
+    VR: point with a controller and pull the trigger.
+  </div>
+  <script type="module">
+// Therapeutic Window XR — keep a simulated patient's drug level inside the therapeutic range.
+// Three.js (WebGL renderer) + WebXR. Works on desktop (mouse/keyboard) and in a VR headset.
+//
+// PK model: one-compartment, first-order oral absorption, integrated numerically so clearance
+// can change mid-game (drug interactions). Parameters are theophylline-like and simplified —
+// for teaching/game purposes only, not clinical dosing.
+
+import * as THREE from 'three';
+import { VRButton } from 'three/addons/webxr/VRButton.js';
+import { XRControllerModelFactory } from 'three/addons/webxr/XRControllerModelFactory.js';
+
+// ---------------------------------------------------------------- game tuning
+const PK = { V: 35, CLbase: 2.8, ka: 1.2, F: 1.0 };   // L, L/h, 1/h  (t½ ≈ 8.7 h)
+const WINDOW = { low: 10, high: 20 };                  // mg/L
+const SIM_HOURS = 72;          // length of one shift
+const HOURS_PER_SEC = 0.8;     // sim hours per real second (~90 s game)
+const MIN_INTERVAL = 4;        // h between doses
+const GRACE = 6;               // h before scoring starts (time to load)
+const Y_MAX = 30;              // graph y-axis max, mg/L
+const DOSES = [100, 200, 300]; // mg
+
+// Clearance-changing events. mult applies on top of earlier events.
+const EVENTS = [
+  { t: 24, key: 'smoke', mult: 1.6, short: 'Smoking',
+    text: 'Patient resumed smoking: CYP1A2 induction, clearance up' },
+  { t: 48, key: 'cipro', mult: 0.65, short: 'Cipro',
+    text: 'Ciprofloxacin started: CYP1A2 inhibition, clearance down' },
+];
+
+// ---------------------------------------------------------------- state
+const state = {};
+function resetState() {
+  Object.assign(state, {
+    running: false, finished: false,
+    t: 0, Ag: 0, Ac: 0, clMult: 1,
+    history: [{ t: 0, c: 0 }], doses: [], firedEvents: [],
+    lastDose: -Infinity, inWin: 0, toxic: 0, sub: 0,
+    message: 'Press START. Doses must be at least 4 h apart.',
+  });
+}
+resetState();
+
+const conc = () => state.Ac / PK.V;
+
+function stepPK(dtH) {
+  const sub = 0.02;
+  let left = dtH;
+  while (left > 0) {
+    const h = Math.min(sub, left);
+    const ke = (PK.CLbase * state.clMult) / PK.V;
+    const absorbed = PK.ka * state.Ag * h;
+    state.Ag -= absorbed;
+    state.Ac += absorbed - ke * state.Ac * h;
+    left -= h;
+  }
+}
+
+function giveDose(mg) {
+  if (!state.running) { flash('Press START first.'); return; }
+  const wait = MIN_INTERVAL - (state.t - state.lastDose);
+  if (wait > 0) { flash(`Too soon. Next dose in ${wait.toFixed(1)} h.`); return; }
+  state.Ag += PK.F * mg;
+  state.lastDose = state.t;
+  state.doses.push({ t: state.t, mg });
+  flash(`Gave ${mg} mg PO at hour ${state.t.toFixed(1)}.`);
+}
+
+function start() {
+  if (state.finished) resetState();
+  if (!state.running) { state.running = true; flash('Shift started. Load the patient!'); }
+}
+
+function flash(msg) { state.message = msg; drawStatus(); }
+
+function update(dtSec) {
+  if (!state.running) return;
+  const dtH = dtSec * HOURS_PER_SEC;
+  const prevT = state.t;
+  stepPK(dtH);
+  state.t = Math.min(SIM_HOURS, state.t + dtH);
+
+  for (const ev of EVENTS) {
+    if (prevT < ev.t && state.t >= ev.t) {
+      state.clMult *= ev.mult;
+      state.firedEvents.push(ev);
+      flash(ev.text);
+    }
+  }
+
+  const c = conc();
+  if (state.t > GRACE) {
+    if (c > WINDOW.high) state.toxic += dtH;
+    else if (c < WINDOW.low) state.sub += dtH;
+    else state.inWin += dtH;
+  }
+
+  const last = state.history[state.history.length - 1];
+  if (state.t - last.t >= 0.1) state.history.push({ t: state.t, c });
+
+  if (state.t >= SIM_HOURS) {
+    state.running = false;
+    state.finished = true;
+    const pct = score();
+    const grade = pct >= 85 ? 'A' : pct >= 70 ? 'B' : pct >= 55 ? 'C' : 'Needs review';
+    state.message = `Shift over: ${pct.toFixed(0)}% in window (${grade}). Press START to replay.`;
+  }
+}
+
+function score() {
+  const total = state.inWin + state.toxic + state.sub;
+  return total > 0 ? (100 * state.inWin) / total : 0;
+}
+
+// ---------------------------------------------------------------- three.js setup
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(window.devicePixelRatio);
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.xr.enabled = true;
+renderer.xr.setReferenceSpaceType('local-floor');
+document.body.appendChild(renderer.domElement);
+document.body.appendChild(VRButton.createButton(renderer));
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x0b1016);
+
+const camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.05, 50);
+camera.position.set(0, 1.6, 0.9);
+camera.lookAt(0, 1.35, -2);
+
+scene.add(new THREE.HemisphereLight(0xdfefff, 0x223040, 1.2));
+const sun = new THREE.DirectionalLight(0xffffff, 1.4);
+sun.position.set(2, 4, 2);
+scene.add(sun);
+
+// room
+const floor = new THREE.Mesh(
+  new THREE.PlaneGeometry(12, 12),
+  new THREE.MeshStandardMaterial({ color: 0x1c2733, roughness: 0.9 })
+);
+floor.rotation.x = -Math.PI / 2;
+scene.add(floor);
+const grid = new THREE.GridHelper(12, 24, 0x2c3e50, 0x22303d);
+grid.position.y = 0.001;
+scene.add(grid);
+
+const counter = new THREE.Mesh(
+  new THREE.BoxGeometry(1.6, 0.9, 0.5),
+  new THREE.MeshStandardMaterial({ color: 0xdfe6ec, roughness: 0.6 })
+);
+counter.position.set(0, 0.45, -0.95);
+scene.add(counter);
+
+// ---------------------------------------------------------------- canvas-texture panels
+function makePanel(wPx, hPx, wM, hM) {
+  const canvas = document.createElement('canvas');
+  canvas.width = wPx; canvas.height = hPx;
+  const ctx = canvas.getContext('2d');
+  const tex = new THREE.CanvasTexture(canvas);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  tex.anisotropy = 4;
+  const mesh = new THREE.Mesh(
+    new THREE.PlaneGeometry(wM, hM),
+    new THREE.MeshBasicMaterial({ map: tex, transparent: true })
+  );
+  return { canvas, ctx, tex, mesh };
+}
+
+// graph
+const graph = makePanel(1280, 640, 2.6, 1.3);
+graph.mesh.position.set(0, 1.65, -2.2);
+scene.add(graph.mesh);
+
+function drawGraph() {
+  const { ctx, canvas } = graph;
+  const W = canvas.width, H = canvas.height;
+  const L = 80, R = 30, T = 60, B = 60;
+  const pw = W - L - R, ph = H - T - B;
+  const x = (t) => L + (t / SIM_HOURS) * pw;
+  const y = (c) => T + ph - (Math.min(c, Y_MAX) / Y_MAX) * ph;
+
+  ctx.fillStyle = '#101a24';
+  roundRect(ctx, 0, 0, W, H, 24); ctx.fill();
+
+  // bands
+  ctx.fillStyle = 'rgba(230,70,70,0.18)';
+  ctx.fillRect(L, y(Y_MAX), pw, y(WINDOW.high) - y(Y_MAX));
+  ctx.fillStyle = 'rgba(60,200,120,0.22)';
+  ctx.fillRect(L, y(WINDOW.high), pw, y(WINDOW.low) - y(WINDOW.high));
+
+  // grid
+  ctx.strokeStyle = 'rgba(255,255,255,0.08)'; ctx.lineWidth = 1;
+  ctx.fillStyle = '#8fa6b8'; ctx.font = '20px system-ui';
+  for (let c = 0; c <= Y_MAX; c += 5) {
+    ctx.beginPath(); ctx.moveTo(L, y(c)); ctx.lineTo(L + pw, y(c)); ctx.stroke();
+    ctx.textAlign = 'right'; ctx.fillText(String(c), L - 10, y(c) + 7);
+  }
+  for (let t = 0; t <= SIM_HOURS; t += 12) {
+    ctx.beginPath(); ctx.moveTo(x(t), T); ctx.lineTo(x(t), T + ph); ctx.stroke();
+    ctx.textAlign = 'center'; ctx.fillText(`${t} h`, x(t), T + ph + 30);
+  }
+
+  // titles
+  ctx.textAlign = 'left'; ctx.fillStyle = '#e6f0f7'; ctx.font = 'bold 28px system-ui';
+  ctx.fillText('Theophylline plasma concentration (mg/L)', L, 40);
+  ctx.textAlign = 'right'; ctx.font = '20px system-ui';
+  ctx.fillStyle = '#6fd69a'; ctx.fillText('therapeutic 10–20', L + pw, 40);
+
+  // events
+  for (const ev of state.firedEvents) {
+    ctx.strokeStyle = '#f2c14e'; ctx.setLineDash([8, 6]); ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.moveTo(x(ev.t), T); ctx.lineTo(x(ev.t), T + ph); ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle = '#f2c14e'; ctx.textAlign = 'left'; ctx.font = 'bold 20px system-ui';
+    ctx.fillText(ev.short, x(ev.t) + 6, T + 24);
+  }
+
+  // dose markers
+  for (const d of state.doses) {
+    const px = x(d.t), py = T + ph;
+    ctx.fillStyle = '#7cc4ff';
+    ctx.beginPath(); ctx.moveTo(px, py - 16); ctx.lineTo(px - 8, py); ctx.lineTo(px + 8, py); ctx.fill();
+    ctx.font = '16px system-ui'; ctx.textAlign = 'center';
+    ctx.fillText(String(d.mg), px, py - 22);
+  }
+
+  // curve
+  ctx.strokeStyle = '#ffffff'; ctx.lineWidth = 4; ctx.lineJoin = 'round';
+  ctx.beginPath();
+  state.history.forEach((p, i) => (i ? ctx.lineTo(x(p.t), y(p.c)) : ctx.moveTo(x(p.t), y(p.c))));
+  ctx.lineTo(x(state.t), y(conc()));
+  ctx.stroke();
+
+  // now cursor
+  ctx.fillStyle = zoneColor(conc());
+  ctx.beginPath(); ctx.arc(x(state.t), y(conc()), 9, 0, Math.PI * 2); ctx.fill();
+
+  graph.tex.needsUpdate = true;
+}
+
+// status panel
+const status = makePanel(800, 560, 1.15, 0.8);
+status.mesh.position.set(1.85, 1.45, -1.6);
+status.mesh.rotation.y = -0.55;
+scene.add(status.mesh);
+
+function drawStatus() {
+  const { ctx, canvas } = status;
+  const W = canvas.width, H = canvas.height;
+  ctx.fillStyle = '#101a24'; roundRect(ctx, 0, 0, W, H, 24); ctx.fill();
+  const c = conc();
+  ctx.textAlign = 'left';
+  ctx.fillStyle = '#8fa6b8'; ctx.font = '26px system-ui';
+  ctx.fillText(`Hour ${state.t.toFixed(1)} / ${SIM_HOURS}`, 36, 56);
+
+  ctx.fillStyle = zoneColor(c); ctx.font = 'bold 84px system-ui';
+  const num = c.toFixed(1);
+  ctx.fillText(num, 36, 160);
+  const numW = ctx.measureText(num).width;
+  ctx.font = '30px system-ui'; ctx.fillText('mg/L  ' + zoneName(c), 36 + numW + 16, 160);
+
+  ctx.fillStyle = '#e6f0f7'; ctx.font = '26px system-ui';
+  ctx.fillText(`Time in window: ${score().toFixed(0)}%`, 36, 220);
+  const wait = Math.max(0, MIN_INTERVAL - (state.t - state.lastDose));
+  ctx.fillText(wait > 0 ? `Next dose in ${wait.toFixed(1)} h` : 'Dose available', 36, 262);
+  ctx.fillStyle = '#8fa6b8';
+  ctx.fillText(`Clearance: ${(PK.CLbase * state.clMult).toFixed(2)} L/h`, 36, 304);
+
+  ctx.fillStyle = '#f2c14e'; ctx.font = '26px system-ui';
+  wrapText(ctx, state.message, 36, 370, W - 72, 34);
+
+  status.tex.needsUpdate = true;
+}
+
+function zoneColor(c) { return c > WINDOW.high ? '#ff6b6b' : c < WINDOW.low ? '#7cc4ff' : '#6fd69a'; }
+function zoneName(c) { return c > WINDOW.high ? 'TOXIC' : c < WINDOW.low ? 'subtherapeutic' : 'in window'; }
+
+function roundRect(ctx, x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y); ctx.arcTo(x + w, y, x + w, y + h, r); ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r); ctx.arcTo(x, y, x + w, y, r); ctx.closePath();
+}
+function wrapText(ctx, text, x, y, maxW, lineH) {
+  let line = '';
+  for (const word of text.split(' ')) {
+    const test = line ? line + ' ' + word : word;
+    if (ctx.measureText(test).width > maxW && line) { ctx.fillText(line, x, y); line = word; y += lineH; }
+    else line = test;
+  }
+  ctx.fillText(line, x, y);
+}
+
+// ---------------------------------------------------------------- patient
+const patient = new THREE.Group();
+const bodyMat = new THREE.MeshStandardMaterial({ color: 0x7cc4ff, roughness: 0.5 });
+const body = new THREE.Mesh(new THREE.CapsuleGeometry(0.22, 0.7, 8, 16), bodyMat);
+body.position.y = 0.6;
+const head = new THREE.Mesh(new THREE.SphereGeometry(0.16, 24, 16), bodyMat);
+head.position.y = 1.32;
+patient.add(body, head);
+patient.position.set(-1.7, 0, -1.6);
+scene.add(patient);
+
+const tag = makePanel(512, 128, 0.8, 0.2);
+tag.ctx.fillStyle = '#101a24'; roundRect(tag.ctx, 0, 0, 512, 128, 20); tag.ctx.fill();
+tag.ctx.fillStyle = '#e6f0f7'; tag.ctx.font = 'bold 34px system-ui'; tag.ctx.textAlign = 'center';
+tag.ctx.fillText('Patient, 70 kg', 256, 54);
+tag.ctx.font = '26px system-ui'; tag.ctx.fillStyle = '#8fa6b8';
+tag.ctx.fillText('Theophylline PO', 256, 98);
+tag.tex.needsUpdate = true;
+tag.mesh.position.set(-1.7, 1.75, -1.6);
+tag.mesh.rotation.y = 0.55;
+scene.add(tag.mesh);
+
+const tmpColor = new THREE.Color();
+function updatePatient(time) {
+  const c = conc();
+  tmpColor.set(zoneColor(c));
+  bodyMat.color.lerp(tmpColor, 0.08);
+  // theophylline toxicity → tremor
+  const shake = c > WINDOW.high ? Math.min(0.03, (c - WINDOW.high) * 0.004) : 0;
+  patient.position.x = -1.7 + Math.sin(time * 60) * shake;
+}
+
+// ---------------------------------------------------------------- buttons
+const buttons = [];
+function makeButton(label, sub, x, color, onPress) {
+  const p = makePanel(384, 192, 0.34, 0.17);
+  const { ctx } = p;
+  ctx.fillStyle = color; roundRect(ctx, 0, 0, 384, 192, 28); ctx.fill();
+  ctx.fillStyle = '#0b1016'; ctx.textAlign = 'center';
+  ctx.font = 'bold 64px system-ui'; ctx.fillText(label, 192, sub ? 100 : 118);
+  if (sub) { ctx.font = '30px system-ui'; ctx.fillText(sub, 192, 150); }
+  p.tex.needsUpdate = true;
+  p.mesh.position.set(x, 1.02, -0.85);
+  p.mesh.rotation.x = -0.9;
+  scene.add(p.mesh);
+  const b = { mesh: p.mesh, onPress, pressT: 0 };
+  p.mesh.userData.button = b;
+  buttons.push(b);
+  return b;
+}
+makeButton('START', '', -0.57, '#f2c14e', start);
+DOSES.forEach((mg, i) => makeButton(`${mg}`, 'mg PO', -0.19 + i * 0.38, '#7cc4ff', () => giveDose(mg)));
+
+function press(b) { b.pressT = 0.15; b.onPress(); }
+
+// ---------------------------------------------------------------- input: XR controllers
+const raycaster = new THREE.Raycaster();
+const tmpMat = new THREE.Matrix4();
+const buttonMeshes = () => buttons.map((b) => b.mesh);
+const controllers = [];
+const factory = new XRControllerModelFactory();
+
+for (let i = 0; i < 2; i++) {
+  const ctrl = renderer.xr.getController(i);
+  const ray = new THREE.Line(
+    new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(), new THREE.Vector3(0, 0, -1)]),
+    new THREE.LineBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.6 })
+  );
+  ray.scale.z = 3;
+  ctrl.add(ray);
+  ctrl.addEventListener('selectstart', () => {
+    const hit = hitFromController(ctrl);
+    if (hit) press(hit);
+  });
+  scene.add(ctrl);
+  controllers.push(ctrl);
+
+  const grip = renderer.xr.getControllerGrip(i);
+  grip.add(factory.createControllerModel(grip));
+  scene.add(grip);
+}
+
+function hitFromController(ctrl) {
+  tmpMat.identity().extractRotation(ctrl.matrixWorld);
+  raycaster.ray.origin.setFromMatrixPosition(ctrl.matrixWorld);
+  raycaster.ray.direction.set(0, 0, -1).applyMatrix4(tmpMat);
+  const hits = raycaster.intersectObjects(buttonMeshes(), false);
+  return hits.length ? hits[0].object.userData.button : null;
+}
+
+// ---------------------------------------------------------------- input: desktop
+const mouse = new THREE.Vector2(-10, -10);
+function hitFromMouse() {
+  raycaster.setFromCamera(mouse, camera);
+  const hits = raycaster.intersectObjects(buttonMeshes(), false);
+  return hits.length ? hits[0].object.userData.button : null;
+}
+renderer.domElement.addEventListener('pointermove', (e) => {
+  mouse.set((e.clientX / window.innerWidth) * 2 - 1, -(e.clientY / window.innerHeight) * 2 + 1);
+});
+renderer.domElement.addEventListener('click', () => {
+  const hit = hitFromMouse();
+  if (hit) press(hit);
+});
+window.addEventListener('keydown', (e) => {
+  if (e.code === 'Space') start();
+  else if (e.key === 'r' || e.key === 'R') { resetState(); drawStatus(); }
+  else if (['1', '2', '3'].includes(e.key)) giveDose(DOSES[Number(e.key) - 1]);
+});
+window.addEventListener('resize', () => {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+});
+
+// ---------------------------------------------------------------- loop
+const clock = new THREE.Clock();
+let redrawAcc = 0;
+
+renderer.setAnimationLoop(() => {
+  const dt = Math.min(clock.getDelta(), 0.1);
+  const time = clock.elapsedTime;
+  update(dt);
+  updatePatient(time);
+
+  // hover + press feedback
+  const hovered = new Set();
+  if (renderer.xr.isPresenting) controllers.forEach((c) => { const h = hitFromController(c); if (h) hovered.add(h); });
+  else { const h = hitFromMouse(); if (h) hovered.add(h); }
+  renderer.domElement.style.cursor = hovered.size ? 'pointer' : 'default';
+  for (const b of buttons) {
+    b.pressT = Math.max(0, b.pressT - dt);
+    const s = b.pressT > 0 ? 0.92 : hovered.has(b) ? 1.08 : 1;
+    b.mesh.scale.setScalar(s);
+  }
+
+  // canvas redraws are cheap but not free — ~20 Hz is plenty
+  redrawAcc += dt;
+  if (redrawAcc > 0.05) { redrawAcc = 0; drawGraph(); drawStatus(); }
+
+  renderer.render(scene, camera);
+});
+
+drawGraph();
+drawStatus();
+
+</script>
+</body>
+</html>
