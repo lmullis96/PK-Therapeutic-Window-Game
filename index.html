@@ -1,0 +1,792 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Therapeutic Window XR</title>
+  <script src="https://cdn.jsdelivr.net/npm/aframe@1.6.0/dist/aframe-v1.6.0.min.js"></script>
+  <style>
+    #help {
+      position: fixed; top: 12px; left: 12px; z-index: 10; color: #cfe3f1; font: 13px/1.5 system-ui, sans-serif;
+      background: rgba(10, 16, 24, 0.8); padding: 10px 12px; border-radius: 8px; max-width: 330px;
+    }
+    #help b { color: #fff; }
+    #help button { margin-top: 6px; background: none; border: 1px solid #567; color: #cfe3f1; border-radius: 4px; cursor: pointer; }
+  </style>
+</head>
+<body>
+  <div id="help">
+    <b>Therapeutic Window XR</b> — theophylline dosing &amp; counseling<br />
+    Desktop: click buttons (drag to look around). Keys: <b>1–4</b> pick / dose / answer,
+    <b>Enter</b> continue, <b>Esc</b> menu.<br />
+    VR: click the goggles icon, then point and pull the trigger.<br />
+    <button onclick="this.parentElement.style.display='none'">Hide</button>
+  </div>
+
+  <a-scene game renderer="antialias: true; colorManagement: true"
+           cursor="rayOrigin: mouse" raycaster="objects: .clickable"
+           background="color: #0b1016" vr-mode-ui="enabled: true">
+    <a-entity light="type: hemisphere; color: #dfefff; groundColor: #223040; intensity: 1.1"></a-entity>
+    <a-entity light="type: directional; intensity: 1.0" position="2 4 2"></a-entity>
+
+    <!-- room -->
+    <a-plane rotation="-90 0 0" width="12" height="12" color="#1c2733"></a-plane>
+    <a-plane position="0 2 -3.2" width="12" height="4" color="#15202b"></a-plane>
+    <a-box position="0 0.45 -0.95" width="1.7" height="0.9" depth="0.5" color="#dfe6ec"></a-box>
+    <a-box position="0 0.905 -0.95" width="1.72" height="0.02" depth="0.52" color="#2e7d5b"></a-box>
+
+    <!-- player -->
+    <a-entity id="rig" position="0 0 0.5">
+      <a-entity camera look-controls="pointerLockEnabled: false" wasd-controls="enabled: false" position="0 1.6 0"></a-entity>
+      <a-entity laser-controls="hand: left" raycaster="objects: .clickable; far: 6; lineColor: #ffffff; lineOpacity: 0.6"></a-entity>
+      <a-entity laser-controls="hand: right" raycaster="objects: .clickable; far: 6; lineColor: #ffffff; lineOpacity: 0.6"></a-entity>
+    </a-entity>
+  </a-scene>
+
+<script>
+/* ======================================================================
+   Therapeutic Window XR (A-Frame / WebXR)
+   Keep a simulated patient's theophylline level in the target range,
+   and counsel the patient when things change.
+
+   PK: one-compartment, first-order oral absorption, integrated numerically
+   so clearance can change mid-shift (interactions, smoking, fever).
+   Parameters are simplified, theophylline-like values for education only —
+   not for clinical dosing.
+   ====================================================================== */
+const THREE = AFRAME.THREE;
+
+// ----------------------------------------------------------- tuning
+const TARGET = { low: 5, high: 15 };   // mg/L (NAEPP asthma target)
+const TOXIC = 20;                      // mg/L
+const SIM_HOURS = 72;
+const HOURS_PER_SEC = 0.6 * (Number(new URLSearchParams(location.search).get('speed')) || 1); // ~2 min per shift
+const MIN_INTERVAL = 4;                // h between doses
+const GRACE = 6;                       // h before scoring starts
+const Y_MAX = 30;
+const KA = 1.2;                        // 1/h absorption
+const EVENT_TIMES = [24, 48];
+const PARTICIPANT = new URLSearchParams(location.search).get('p') || '';
+const STORE_KEY = 'twxr-sessions-v1';
+
+// ----------------------------------------------------------- patient profiles (population health)
+const PROFILES = [
+  { key: 'adult', name: 'Mr. Davis, 45', sub: 'Asthma · non-smoker · 70 kg', V: 35, CL: 2.8,
+    doses: [100, 200, 300], scale: 1, events: ['smokeStart', 'cipro'],
+    note: 'Typical adult clearance.' },
+  { key: 'smoker', name: 'Ms. Reyes, 52', sub: 'COPD · smokes 1 pack/day · 70 kg', V: 35, CL: 4.5,
+    doses: [200, 300, 400], scale: 1, events: ['smokeQuit', 'missedDose'],
+    note: 'Smoking induces CYP1A2: clearance is about 1.6× normal.' },
+  { key: 'chf', name: 'Mr. Okafor, 74', sub: 'COPD + heart failure · 75 kg', V: 37.5, CL: 1.5,
+    doses: [100, 200, 300], scale: 0.97, events: ['cipro', 'missedDose'],
+    note: 'Heart failure and older age reduce clearance by about half.' },
+  { key: 'child', name: 'Liam, 8', sub: 'Asthma · 25 kg · parent present', V: 12.5, CL: 2.0, child: true,
+    doses: [50, 100, 150], scale: 0.68, events: ['fever', 'missedDose'],
+    note: 'Children 1–9 y clear theophylline faster per kg.' },
+];
+
+// ----------------------------------------------------------- counseling moments (communication)
+const EVENTS = {
+  smokeStart: {
+    short: 'Started smoking', clMult: 1.6,
+    quote: '"Work has been stressful... I started smoking again this week."',
+    options: [
+      { best: true, text: "Smoking speeds up how fast you clear theophylline, so it may work less well. I'll ask your prescriber to check a level." },
+      { text: "Smoking only affects your lungs, not your medicines, so keep taking your theophylline exactly the same way as before.", why: "Smoking induces CYP1A2 and can raise theophylline clearance 1.5–2×." },
+      { text: "Since smoking tightens your airways, take an extra dose on any day you feel more short of breath than usual.", why: "Self-adjusting a narrow-therapeutic-index drug risks toxicity." },
+    ],
+    teach: 'Tobacco smoke induces CYP1A2, so clearance rises and levels fall. Asthma control can worsen. Notify the prescriber, consider a level, and offer cessation support.',
+  },
+  smokeQuit: {
+    short: 'Quit smoking', clMult: 0.7,
+    quote: '"Good news, I quit smoking last week!"',
+    options: [
+      { best: true, text: "Congratulations! Your level may slowly rise now, so tell your prescriber if you get nausea, shakiness, or a racing heart." },
+      { text: "Congratulations! Since your lungs will start healing now, you can probably stop taking theophylline in a week or two.", why: "Quitting doesn't cure COPD. Stopping therapy without the prescriber is unsafe." },
+      { text: "Congratulations! Quitting won't change how your medicines work, so keep the same dose and we'll review it next year.", why: "Losing CYP1A2 induction lowers clearance. Levels can climb toward toxicity over 1–2 weeks." },
+    ],
+    teach: 'When CYP1A2 induction wears off, clearance falls and levels rise. Praise the quit attempt, explain toxicity symptoms, and recommend a dose and level review.',
+  },
+  cipro: {
+    short: 'Ciprofloxacin', clMult: 0.65,
+    quote: '"My doctor gave me ciprofloxacin for a urinary infection."',
+    options: [
+      { best: true, text: "Ciprofloxacin can raise your theophylline level. I'll call your prescriber about another antibiotic or a lower dose." },
+      { text: "Take them at least two hours apart so they don't interact in your stomach, and both medicines will work normally.", why: "This is a metabolic (CYP1A2) interaction, not an absorption one. Spacing doses doesn't help." },
+      { text: "Antibiotics don't interact with breathing medicines, so you can take both together exactly as they were prescribed.", why: "Ciprofloxacin inhibits CYP1A2 and can cut theophylline clearance by 30% or more." },
+    ],
+    teach: 'Ciprofloxacin inhibits CYP1A2, so theophylline clearance falls and levels rise. Contact the prescriber (alternative antibiotic or dose reduction) and monitor levels.',
+  },
+  fever: {
+    short: 'Fever / flu', clMult: 0.7,
+    quote: 'Parent: "Liam has had the flu with a 102°F fever for two days."',
+    options: [
+      { best: true, text: "A fever can raise his theophylline level. Watch for vomiting or a fast heartbeat, and call his doctor today about his dose." },
+      { text: "Give him an extra dose while he's sick so the infection doesn't trigger an asthma attack on top of the flu.", why: "Febrile illness lowers clearance. An extra dose adds to the toxicity risk." },
+      { text: "A fever won't change how his medicine works, so keep giving it as usual and treat the fever with rest and fluids at home.", why: "Prolonged fever decreases theophylline clearance, especially in children." },
+    ],
+    teach: 'Sustained fever reduces theophylline clearance. Teach caregivers the signs of toxicity in children and to contact the prescriber.',
+  },
+  missedDose: {
+    short: 'Missed dose', clMult: 1,
+    quote: '"I forgot my last dose. Should I take two next time to catch up?"',
+    quoteChild: 'Parent: "I forgot his last dose. Should I give two next time to catch up?"',
+    options: [
+      { best: true, text: "Don't double up. Take it when you remember, unless it's almost time for the next one. Then just skip it." },
+      { text: "Yes, take two at the next scheduled time so the level stays steady and breathing stays well controlled.", why: "Doubling a narrow-therapeutic-index drug can push levels into the toxic range." },
+      { text: "Skip the rest of today's doses and restart tomorrow morning so the schedule lines up again cleanly.", why: "Unneeded gaps let levels fall below target and symptoms return." },
+    ],
+    teach: 'Never double doses of a narrow-therapeutic-index drug. Follow the product\'s missed-dose directions and keep a regular schedule.',
+  },
+  toxic: {
+    short: 'Toxic symptoms', clMult: 1,
+    quote: '"I feel shaky and sick to my stomach, and my heart is racing."',
+    quoteChild: 'Parent: "Liam threw up, he\'s shaky, and his heart is pounding."',
+    options: [
+      { best: true, text: "Those can be signs of too much theophylline. Hold the next dose. I'm calling the prescriber; call 911 for chest pain or a seizure." },
+      { text: "That sounds like anxiety, which is common with breathing problems. Take the next dose as normal and rest for a while.", why: "Nausea, tachycardia, and tremor are classic early theophylline toxicity." },
+      { text: "Have a cup of coffee and something light to eat. That usually settles the stomach, and it should pass soon.", why: "Caffeine is a methylxanthine like theophylline and worsens these effects." },
+    ],
+    teach: 'Early toxicity: nausea/vomiting, tachycardia, tremor, restlessness. Severe toxicity: arrhythmias and seizures. Hold doses, get a level, and escalate care.',
+  },
+};
+
+const KEY_POINTS = [
+  'Theophylline has a narrow therapeutic index. Target about 5–15 mg/L. Toxicity becomes common above 20.',
+  'Steady state takes about 5 half-lives, so a level drawn too early can mislead you.',
+  'Clearance goes UP with smoking (CYP1A2 induction) and in children aged 1–9.',
+  'Clearance goes DOWN with ciprofloxacin, erythromycin, fluvoxamine, cimetidine, heart failure, liver disease, fever, and older age.',
+  'Counsel on signs of toxicity: nausea/vomiting, fast heartbeat, tremor. Severe toxicity can cause seizures.',
+  'Any change in smoking, a new medication, or illness is a reason to recheck the level or dose.',
+];
+
+// ----------------------------------------------------------- state
+const S = { mode: 'menu' };
+function newSession(p) {
+  Object.assign(S, {
+    mode: 'play', profile: p, t: 0, Ag: 0, Ac: 0, clMult: 1,
+    history: [{ t: 0, c: 0 }], doses: [], fired: [], lastDose: -Infinity,
+    inT: 0, above: 0, toxic: 0, below: 0, toxicAsked: false,
+    schedule: p.events.map((k, i) => ({ t: EVENT_TIMES[i], key: k, done: false })),
+    counsel: [], current: null, page: 1, startedAt: Date.now(),
+    msg: `${p.name}. ${p.note} Give the first dose to start loading.`,
+  });
+}
+
+const conc = () => (S.profile ? S.Ac / S.profile.V : 0);
+const CL = () => S.profile.CL * S.clMult;
+const halfLife = () => (0.693 * S.profile.V) / CL();
+
+function stepPK(dtH) {
+  let left = dtH;
+  while (left > 0) {
+    const h = Math.min(0.02, left);
+    const ke = CL() / S.profile.V;
+    const abs = KA * S.Ag * h;
+    S.Ag -= abs;
+    S.Ac += abs - ke * S.Ac * h;
+    left -= h;
+  }
+}
+
+function zone(c) {
+  if (c > TOXIC) return { name: 'TOXIC', color: '#ff6b6b' };
+  if (c > TARGET.high) return { name: 'above target', color: '#f2a94e' };
+  if (c < TARGET.low) return { name: 'below target', color: '#7cc4ff' };
+  return { name: 'in target', color: '#6fd69a' };
+}
+
+function pctTarget() {
+  const tot = S.inT + S.above + S.toxic + S.below;
+  return tot > 0 ? (100 * S.inT) / tot : 0;
+}
+
+// ----------------------------------------------------------- game actions
+function giveDose(mg) {
+  if (S.mode !== 'play') return;
+  const wait = MIN_INTERVAL - (S.t - S.lastDose);
+  if (wait > 0) { S.msg = `Too soon. Next dose allowed in ${wait.toFixed(1)} h.`; return; }
+  S.Ag += mg;
+  S.lastDose = S.t;
+  S.doses.push({ t: +S.t.toFixed(2), mg, c: +conc().toFixed(2) });
+  S.msg = `Gave ${mg} mg PO at hour ${S.t.toFixed(1)}.`;
+}
+
+function fireEvent(key) {
+  const ev = EVENTS[key];
+  S.clMult *= ev.clMult;
+  S.fired.push({ t: S.t, key, short: ev.short });
+  const order = [0, 1, 2].sort(() => Math.random() - 0.5);
+  S.current = { key, ev, order, shownAt: performance.now(), chosen: null, t: S.t };
+  S.mode = 'counsel';
+  showCounsel();
+}
+
+function choose(slot) {
+  const cur = S.current;
+  if (!cur || cur.chosen !== null) return;
+  const idx = cur.order[slot];
+  cur.chosen = idx;
+  const opt = cur.ev.options[idx];
+  S.counsel.push({
+    key: cur.key, hour: +cur.t.toFixed(1), correct: !!opt.best,
+    seconds: +((performance.now() - cur.shownAt) / 1000).toFixed(1),
+  });
+  showFeedback();
+}
+
+function resume() {
+  S.current = null;
+  S.mode = 'play';
+  hideModal();
+}
+
+function update(dtSec) {
+  if (S.mode !== 'play') return;
+  const dtH = dtSec * HOURS_PER_SEC;
+  stepPK(dtH);
+  S.t = Math.min(SIM_HOURS, S.t + dtH);
+  const c = conc();
+  if (S.t > GRACE) {
+    if (c > TOXIC) S.toxic += dtH;
+    else if (c > TARGET.high) S.above += dtH;
+    else if (c < TARGET.low) S.below += dtH;
+    else S.inT += dtH;
+  }
+  const last = S.history[S.history.length - 1];
+  if (S.t - last.t >= 0.1) S.history.push({ t: S.t, c });
+
+  if (S.t >= SIM_HOURS) return endShift();
+  if (!S.toxicAsked && c > TOXIC) { S.toxicAsked = true; return fireEvent('toxic'); }
+  const due = S.schedule.find((e) => !e.done && S.t >= e.t);
+  if (due) { due.done = true; fireEvent(due.key); }
+}
+
+function endShift() {
+  S.mode = 'debrief';
+  S.page = 1;
+  saveSession();
+  showDebrief();
+}
+
+// ----------------------------------------------------------- user-testing log
+function sessionRecord() {
+  const right = S.counsel.filter((x) => x.correct).length;
+  const rec = {
+    session_id: S.startedAt.toString(36),
+    participant: PARTICIPANT,
+    date: new Date(S.startedAt).toISOString(),
+    profile: S.profile.key,
+    pct_in_target: +pctTarget().toFixed(1),
+    hours_toxic: +S.toxic.toFixed(1),
+    hours_above_target: +S.above.toFixed(1),
+    hours_below_target: +S.below.toFixed(1),
+    doses_given: S.doses.length,
+    total_mg: S.doses.reduce((a, d) => a + d.mg, 0),
+    dose_log: S.doses.map((d) => `${d.mg}mg@${d.t}h`).join(' '),
+    counseling_correct: right,
+    counseling_total: S.counsel.length,
+    duration_s: Math.round((Date.now() - S.startedAt) / 1000),
+  };
+  S.counsel.slice(0, 3).forEach((x, i) => {
+    rec[`c${i + 1}_moment`] = x.key;
+    rec[`c${i + 1}_correct`] = x.correct ? 1 : 0;
+    rec[`c${i + 1}_seconds`] = x.seconds;
+  });
+  return rec;
+}
+function loadSessions() {
+  try { return JSON.parse(localStorage.getItem(STORE_KEY)) || []; } catch (e) { return []; }
+}
+function saveSession() {
+  const all = loadSessions();
+  all.push(sessionRecord());
+  try { localStorage.setItem(STORE_KEY, JSON.stringify(all)); } catch (e) { /* storage unavailable */ }
+}
+function exportCSV() {
+  const rows = loadSessions();
+  if (!rows.length) { alert('No completed sessions yet.'); return; }
+  const cols = ['session_id', 'participant', 'date', 'profile', 'pct_in_target', 'hours_toxic',
+    'hours_above_target', 'hours_below_target', 'doses_given', 'total_mg', 'dose_log',
+    'counseling_correct', 'counseling_total', 'duration_s',
+    'c1_moment', 'c1_correct', 'c1_seconds', 'c2_moment', 'c2_correct', 'c2_seconds',
+    'c3_moment', 'c3_correct', 'c3_seconds'];
+  const esc = (v) => `"${String(v ?? '').replace(/"/g, '""')}"`;
+  const csv = [cols.join(','), ...rows.map((r) => cols.map((c) => esc(r[c])).join(','))].join('\n');
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([csv], { type: 'text/csv' }));
+  a.download = `therapeutic-window-sessions-${new Date().toISOString().slice(0, 10)}.csv`;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 2000);
+}
+
+// ----------------------------------------------------------- canvas panels
+AFRAME.registerComponent('panel', {
+  schema: { w: { default: 1 }, h: { default: 0.5 }, ppm: { default: 1000 } },
+  init() {
+    const d = this.data;
+    this.canvas = document.createElement('canvas');
+    this.canvas.width = Math.round(d.w * d.ppm);
+    this.canvas.height = Math.round(d.h * d.ppm);
+    this.ctx = this.canvas.getContext('2d');
+    this.tex = new THREE.CanvasTexture(this.canvas);
+    this.tex.colorSpace = THREE.SRGBColorSpace;
+    this.tex.anisotropy = 4;
+    this.mesh = new THREE.Mesh(new THREE.PlaneGeometry(d.w, d.h),
+      new THREE.MeshBasicMaterial({ map: this.tex, transparent: true }));
+    this.el.setObject3D('mesh', this.mesh);
+    if (this.el._draw) redraw(this.el);
+  },
+  remove() { this.el.removeObject3D('mesh'); this.tex.dispose(); },
+});
+
+function redraw(el) {
+  const p = el.components && el.components.panel;
+  if (!p || !p.ctx || !el._draw) return;
+  p.ctx.clearRect(0, 0, p.canvas.width, p.canvas.height);
+  el._draw(p.ctx, p.canvas.width, p.canvas.height);
+  p.tex.needsUpdate = true;
+}
+
+function makePanel(parent, { w, h, ppm = 1000, pos = '0 0 0', rot = '0 0 0' }, draw) {
+  const el = document.createElement('a-entity');
+  el.setAttribute('panel', { w, h, ppm });
+  el.setAttribute('position', pos);
+  el.setAttribute('rotation', rot);
+  el._draw = draw;
+  parent.appendChild(el);
+  return el;
+}
+
+function makeButton(parent, o) {
+  const { w, h, label = '', sub = '', text = '', color = '#7cc4ff', fontPx = 56,
+    enabled = () => true, onPress } = o;
+  const el = makePanel(parent, { w, h, ppm: o.ppm || 1000, pos: o.pos, rot: o.rot }, (ctx, W, H) => {
+    const on = enabled();
+    ctx.fillStyle = on ? color : '#3a4654';
+    roundRect(ctx, 4, 4, W - 8, H - 8, Math.min(28, H / 4)); ctx.fill();
+    if (el._hover && on) { ctx.strokeStyle = '#ffffff'; ctx.lineWidth = 6; ctx.stroke(); }
+    ctx.fillStyle = on ? '#0b1016' : '#8592a0';
+    if (text) {
+      ctx.textAlign = 'left'; ctx.font = `${fontPx}px system-ui`;
+      const lines = wrapLines(ctx, text, W - 60);
+      const lh = fontPx * 1.25;
+      let y = H / 2 - ((lines.length - 1) * lh) / 2 + fontPx * 0.35;
+      lines.forEach((ln) => { ctx.fillText(ln, 30, y); y += lh; });
+    } else {
+      ctx.textAlign = 'center';
+      ctx.font = `bold ${fontPx}px system-ui`;
+      ctx.fillText(label, W / 2, sub ? H * 0.5 : H * 0.5 + fontPx * 0.35);
+      if (sub) { ctx.font = `${fontPx * 0.5}px system-ui`; ctx.fillText(sub, W / 2, H * 0.5 + fontPx * 0.75); }
+    }
+  });
+  el.classList.add('clickable');
+  el.addEventListener('mouseenter', () => { el._hover = true; redraw(el); });
+  el.addEventListener('mouseleave', () => { el._hover = false; redraw(el); });
+  el.addEventListener('click', () => {
+    if (!enabled()) return;
+    el.object3D.scale.setScalar(0.94);
+    setTimeout(() => el.object3D.scale.setScalar(1), 120);
+    onPress();
+  });
+  return el;
+}
+
+function roundRect(ctx, x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y); ctx.arcTo(x + w, y, x + w, y + h, r); ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r); ctx.arcTo(x, y, x + w, y, r); ctx.closePath();
+}
+function wrapLines(ctx, text, maxW) {
+  const out = []; let line = '';
+  for (const word of text.split(' ')) {
+    const test = line ? line + ' ' + word : word;
+    if (ctx.measureText(test).width > maxW && line) { out.push(line); line = word; } else line = test;
+  }
+  if (line) out.push(line);
+  return out;
+}
+function para(ctx, text, x, y, maxW, lh) {
+  for (const ln of wrapLines(ctx, text, maxW)) { ctx.fillText(ln, x, y); y += lh; }
+  return y;
+}
+function bg(ctx, W, H) { ctx.fillStyle = '#101a24'; roundRect(ctx, 0, 0, W, H, 26); ctx.fill(); }
+
+// ----------------------------------------------------------- chart
+function drawChart(ctx, X, Y, W, H, k = 1) {
+  const L = X + 70 * k, R = X + W - 24 * k, T = Y + 56 * k, B = Y + H - 46 * k;
+  const pw = R - L, ph = B - T;
+  const x = (t) => L + (t / SIM_HOURS) * pw;
+  const y = (c) => T + ph - (Math.min(c, Y_MAX) / Y_MAX) * ph;
+  ctx.fillStyle = '#101a24'; roundRect(ctx, X, Y, W, H, 22 * k); ctx.fill();
+
+  ctx.fillStyle = 'rgba(230,70,70,0.20)'; ctx.fillRect(L, y(Y_MAX), pw, y(TOXIC) - y(Y_MAX));
+  ctx.fillStyle = 'rgba(242,169,78,0.16)'; ctx.fillRect(L, y(TOXIC), pw, y(TARGET.high) - y(TOXIC));
+  ctx.fillStyle = 'rgba(60,200,120,0.22)'; ctx.fillRect(L, y(TARGET.high), pw, y(TARGET.low) - y(TARGET.high));
+
+  ctx.strokeStyle = 'rgba(255,255,255,0.08)'; ctx.lineWidth = 1;
+  ctx.fillStyle = '#8fa6b8'; ctx.font = `${19 * k}px system-ui`;
+  for (let c = 0; c <= Y_MAX; c += 5) {
+    ctx.beginPath(); ctx.moveTo(L, y(c)); ctx.lineTo(R, y(c)); ctx.stroke();
+    ctx.textAlign = 'right'; ctx.fillText(String(c), L - 10 * k, y(c) + 7 * k);
+  }
+  for (let t = 0; t <= SIM_HOURS; t += 12) {
+    ctx.beginPath(); ctx.moveTo(x(t), T); ctx.lineTo(x(t), B); ctx.stroke();
+    ctx.textAlign = 'center'; ctx.fillText(`${t} h`, x(t), B + 30 * k);
+  }
+  ctx.textAlign = 'left'; ctx.fillStyle = '#e6f0f7'; ctx.font = `bold ${26 * k}px system-ui`;
+  ctx.fillText('Theophylline level (mg/L)', L, Y + 38 * k);
+  ctx.textAlign = 'right'; ctx.font = `${18 * k}px system-ui`;
+  ctx.fillStyle = '#ff6b6b'; ctx.fillText('toxic >20', R, Y + 38 * k);
+  ctx.fillStyle = '#6fd69a'; ctx.fillText('target 5–15   ', R - ctx.measureText('toxic >20').width, Y + 38 * k);
+
+  if (!S.profile) return;
+  for (const ev of S.fired) {
+    ctx.strokeStyle = '#f2c14e'; ctx.setLineDash([8 * k, 6 * k]); ctx.lineWidth = 2 * k;
+    ctx.beginPath(); ctx.moveTo(x(ev.t), T); ctx.lineTo(x(ev.t), B); ctx.stroke(); ctx.setLineDash([]);
+    ctx.fillStyle = '#f2c14e'; ctx.textAlign = 'left'; ctx.font = `bold ${17 * k}px system-ui`;
+    ctx.fillText(ev.short, x(ev.t) + 6 * k, T + 22 * k);
+  }
+  for (const d of S.doses) {
+    const px = x(d.t);
+    ctx.fillStyle = '#7cc4ff';
+    ctx.beginPath(); ctx.moveTo(px, B - 14 * k); ctx.lineTo(px - 7 * k, B); ctx.lineTo(px + 7 * k, B); ctx.fill();
+  }
+  ctx.strokeStyle = '#ffffff'; ctx.lineWidth = 4 * k; ctx.lineJoin = 'round';
+  ctx.beginPath();
+  S.history.forEach((p, i) => (i ? ctx.lineTo(x(p.t), y(p.c)) : ctx.moveTo(x(p.t), y(p.c))));
+  ctx.lineTo(x(S.t), y(conc()));
+  ctx.stroke();
+  ctx.fillStyle = zone(conc()).color;
+  ctx.beginPath(); ctx.arc(x(S.t), y(conc()), 8 * k, 0, Math.PI * 2); ctx.fill();
+}
+
+// ----------------------------------------------------------- scene objects
+let graphEl, statusEl, tagEl, modalEl, controlsEl, patientEl, bodyMat;
+const doseBtns = [];
+const modalBtns = [];
+
+function setupScene(scene) {
+  graphEl = makePanel(scene, { w: 2.6, h: 1.3, ppm: 500, pos: '0 2.42 -2.6' },
+    (ctx, W, H) => drawChart(ctx, 0, 0, W, H, 1));
+
+  statusEl = makePanel(scene, { w: 1.1, h: 0.86, ppm: 700, pos: '1.75 1.55 -1.7', rot: '0 -32 0' }, drawStatus);
+
+  // patient (simple avatar whose color shows the zone and who trembles when toxic)
+  patientEl = document.createElement('a-entity');
+  patientEl.setAttribute('position', '-1.65 0 -1.7');
+  patientEl.innerHTML = `
+    <a-cylinder radius="0.22" height="0.8" position="0 0.62 0" color="#7cc4ff"></a-cylinder>
+    <a-sphere radius="0.22" position="0 1.02 0" color="#7cc4ff"></a-sphere>
+    <a-sphere radius="0.16" position="0 1.38 0" color="#e9c9a8"></a-sphere>`;
+  scene.appendChild(patientEl);
+  tagEl = makePanel(scene, { w: 0.9, h: 0.24, ppm: 600, pos: '-1.65 1.82 -1.7', rot: '0 32 0' }, drawTag);
+
+  // dosing controls on the counter
+  controlsEl = document.createElement('a-entity');
+  controlsEl.setAttribute('position', '0 1.0 -0.86');
+  controlsEl.setAttribute('rotation', '-55 0 0');
+  scene.appendChild(controlsEl);
+  [0, 1, 2].forEach((i) => {
+    doseBtns.push(makeButton(controlsEl, {
+      w: 0.34, h: 0.17, pos: `${-0.57 + i * 0.38} 0 0`, ppm: 1000, color: '#7cc4ff',
+      enabled: () => S.mode === 'play' && S.t - S.lastDose >= MIN_INTERVAL,
+      onPress: () => giveDose(S.profile.doses[i]),
+    }));
+  });
+  doseBtns.forEach((b, i) => {
+    const inner = b._draw;
+    b._draw = (ctx, W, H) => {
+      const on = S.mode === 'play' && S.t - S.lastDose >= MIN_INTERVAL;
+      ctx.fillStyle = on ? '#7cc4ff' : '#3a4654';
+      roundRect(ctx, 4, 4, W - 8, H - 8, 28); ctx.fill();
+      if (b._hover && on) { ctx.strokeStyle = '#fff'; ctx.lineWidth = 6; ctx.stroke(); }
+      ctx.fillStyle = on ? '#0b1016' : '#8592a0'; ctx.textAlign = 'center';
+      ctx.font = 'bold 60px system-ui';
+      ctx.fillText(S.profile ? `${S.profile.doses[i]}` : '—', W / 2, H * 0.52);
+      ctx.font = '28px system-ui'; ctx.fillText('mg PO', W / 2, H * 0.52 + 40);
+    };
+  });
+  makeButton(controlsEl, {
+    w: 0.34, h: 0.17, pos: '0.57 0 0', label: 'Menu', fontPx: 52, color: '#c3ced8',
+    enabled: () => S.mode === 'play', onPress: toMenu,
+  });
+
+  // modal (menu, counseling, debrief) floats in front of the counter
+  modalEl = makePanel(scene, { w: 1.6, h: 0.98, ppm: 1000, pos: '0 1.36 -1.32', rot: '-8 0 0' }, () => {});
+}
+
+function clearModalButtons() { while (modalBtns.length) modalBtns.pop().remove(); }
+function showModal(draw, buttons) {
+  clearModalButtons();
+  modalEl._draw = draw;
+  modalEl.setAttribute('visible', true);
+  redraw(modalEl);
+  buttons.forEach((b) => modalBtns.push(makeButton(modalEl, { ...b, pos: `${b.x} ${b.y} 0.005` })));
+  controlsEl.setAttribute('visible', false);
+  controlsEl.querySelectorAll('[panel]').forEach((e) => e.classList.remove('clickable'));
+}
+function hideModal() {
+  clearModalButtons();
+  modalEl.setAttribute('visible', false);
+  controlsEl.setAttribute('visible', true);
+  controlsEl.querySelectorAll('[panel]').forEach((e) => e.classList.add('clickable'));
+}
+// modal canvas y (px) for a local y (m) — modal is 0.98 m tall at 1000 px/m
+const py = (localY) => (0.49 - localY) * 1000;
+
+// ----------------------------------------------------------- screens
+function toMenu() {
+  S.mode = 'menu';
+  S.profile = null;
+  showMenu();
+  redraw(graphEl); redraw(statusEl); redraw(tagEl); doseBtns.forEach(redraw);
+}
+
+function showMenu() {
+  const n = loadSessions().length;
+  const btns = PROFILES.map((p, i) => ({
+    w: 0.72, h: 0.17, x: i % 2 ? 0.38 : -0.38, y: i < 2 ? -0.06 : -0.26,
+    label: `${i + 1}. ${p.name}`, sub: p.sub, fontPx: 46, color: '#7cc4ff',
+    onPress: () => startGame(p),
+  }));
+  btns.push({ w: 0.42, h: 0.08, x: 0.56, y: -0.42, label: 'Export test data', fontPx: 30, color: '#c3ced8', onPress: exportCSV });
+  showModal((ctx, W, H) => {
+    bg(ctx, W, H);
+    ctx.textAlign = 'left'; ctx.fillStyle = '#e6f0f7'; ctx.font = 'bold 64px system-ui';
+    ctx.fillText('Therapeutic Window', 60, 90);
+    ctx.fillStyle = '#6fd69a'; ctx.font = '30px system-ui';
+    ctx.fillText('A theophylline dosing & patient-counseling simulator', 60, 136);
+    ctx.fillStyle = '#cfdbe5'; ctx.font = '28px system-ui';
+    let y = 196;
+    for (const line of [
+      '• Dose by mouth to keep the level in the green target band (5–15 mg/L) for 72 hours.',
+      '• Doses must be at least 4 h apart. Scoring starts after hour 6.',
+      '• When something changes, the patient will talk to you. Pick the best counseling reply.',
+    ]) y = para(ctx, line, 60, y, W - 120, 38);
+    ctx.fillStyle = '#f2c14e'; ctx.font = 'bold 32px system-ui';
+    ctx.fillText('Choose a patient:', 60, py(0.06) - 22);
+    ctx.fillStyle = '#8fa6b8'; ctx.font = '24px system-ui';
+    ctx.fillText(`${PARTICIPANT ? 'Participant ' + PARTICIPANT + ' · ' : ''}${n} session${n === 1 ? '' : 's'} saved on this device · Educational simulation, not for clinical use`, 60, py(-0.42) + 8);
+  }, btns);
+}
+
+function startGame(p) {
+  newSession(p);
+  hideModal();
+  patientEl.object3D.scale.setScalar(p.scale);
+  redraw(tagEl);
+  doseBtns.forEach(redraw);
+}
+
+function showCounsel() {
+  const { ev, order } = S.current;
+  const quote = (S.profile.child && ev.quoteChild) || ev.quote;
+  const btns = order.map((idx, slot) => ({
+    w: 1.5, h: 0.15, x: 0, y: -0.02 - slot * 0.165,
+    text: `${slot + 1}. ${ev.options[idx].text}`, fontPx: 27, color: '#dfe9f1',
+    onPress: () => choose(slot),
+  }));
+  showModal((ctx, W, H) => {
+    bg(ctx, W, H);
+    ctx.textAlign = 'left'; ctx.fillStyle = '#f2c14e'; ctx.font = 'bold 34px system-ui';
+    ctx.fillText(`Counseling moment · Hour ${S.current.t.toFixed(0)} · ${S.profile.name}`, 60, 70);
+    ctx.fillStyle = '#ffffff'; ctx.font = 'italic 40px system-ui';
+    let y = para(ctx, quote, 60, 140, W - 120, 52);
+    ctx.fillStyle = '#8fa6b8'; ctx.font = '28px system-ui';
+    ctx.fillText(`Current level: ${conc().toFixed(1)} mg/L. What is the best response?`, 60, y + 20);
+  }, btns);
+}
+
+function showFeedback() {
+  const { ev, chosen } = S.current;
+  const opt = ev.options[chosen];
+  const best = ev.options.find((o) => o.best);
+  showModal((ctx, W, H) => {
+    bg(ctx, W, H);
+    ctx.textAlign = 'left';
+    ctx.fillStyle = opt.best ? '#6fd69a' : '#ff8a8a'; ctx.font = 'bold 48px system-ui';
+    ctx.fillText(opt.best ? '✓ Best response' : '✗ Not the best response', 60, 86);
+    let y = 150;
+    ctx.font = '30px system-ui'; ctx.fillStyle = '#e6f0f7';
+    if (!opt.best) {
+      y = para(ctx, `Why: ${opt.why}`, 60, y, W - 120, 40) + 14;
+      ctx.fillStyle = '#6fd69a';
+      y = para(ctx, `Better: ${best.text}`, 60, y, W - 120, 40) + 14;
+    }
+    ctx.fillStyle = '#f2c14e'; ctx.font = 'bold 30px system-ui';
+    ctx.fillText('Teaching point', 60, y + 10);
+    ctx.fillStyle = '#cfdbe5'; ctx.font = '30px system-ui';
+    y = para(ctx, ev.teach, 60, y + 52, W - 120, 40);
+    if (ev.clMult !== 1) {
+      ctx.fillStyle = '#8fa6b8'; ctx.font = '26px system-ui';
+      ctx.fillText(`Clearance is now ${CL().toFixed(2)} L/h (t½ ≈ ${halfLife().toFixed(1)} h). Adjust your dosing.`, 60, y + 20);
+    }
+  }, [{ w: 0.5, h: 0.11, x: 0, y: -0.39, label: 'Continue', fontPx: 46, color: '#f2c14e', onPress: resume }]);
+}
+
+function avgLevel(t0, t1) {
+  const pts = S.history.filter((p) => p.t >= t0 && p.t <= t1);
+  return pts.length ? pts.reduce((a, p) => a + p.c, 0) / pts.length : 0;
+}
+
+function suggestedRegimen() {
+  const tau = halfLife() < 6 ? 6 : 8;
+  const ideal = 10 * CL() * tau;                // aim for the middle of 5–15
+  const step = S.profile.doses[0];
+  const dose = Math.max(step, Math.round(ideal / step) * step);
+  return { dose, tau, avg: dose / (CL() * tau) };
+}
+
+function showDebrief() {
+  const btn = (label, x, onPress, color = '#c3ced8') => ({ w: 0.44, h: 0.1, x, y: -0.405, label, fontPx: 36, color, onPress });
+  const nav = S.page === 1
+    ? btn('Teaching points ›', 0.53, () => { S.page = 2; showDebrief(); }, '#f2c14e')
+    : btn('‹ Results', 0.53, () => { S.page = 1; showDebrief(); }, '#f2c14e');
+  const buttons = [btn('Play again', -0.53, toMenu, '#7cc4ff'), btn('Export test data', 0, exportCSV), nav];
+  showModal(S.page === 1 ? drawDebrief1 : drawDebrief2, buttons);
+}
+
+function drawDebrief1(ctx, W, H) {
+  bg(ctx, W, H);
+  const pct = pctTarget();
+  const right = S.counsel.filter((x) => x.correct).length;
+  const grade = pct >= 80 ? 'Excellent' : pct >= 65 ? 'Good' : pct >= 50 ? 'Fair' : 'Needs review';
+  ctx.textAlign = 'left'; ctx.fillStyle = '#e6f0f7'; ctx.font = 'bold 44px system-ui';
+  ctx.fillText(`Shift debrief · ${S.profile.name}`, 50, 70);
+  ctx.font = '28px system-ui'; ctx.fillStyle = '#6fd69a';
+  ctx.fillText(`Dosing: ${pct.toFixed(0)}% in target (${grade})`, 50, 118);
+  ctx.fillStyle = '#f2c14e';
+  ctx.fillText(`Counseling: ${right}/${S.counsel.length} best responses`, 560, 118);
+  ctx.fillStyle = '#8fa6b8';
+  ctx.fillText(`Toxic ${S.toxic.toFixed(1)} h · Above ${S.above.toFixed(1)} h · Below ${S.below.toFixed(1)} h`, 1040, 118);
+
+  drawChart(ctx, 40, 145, 900, 560, 0.95);
+
+  // what happened
+  let y = 190; const X = 975, MW = W - X - 45;
+  ctx.fillStyle = '#e6f0f7'; ctx.font = 'bold 30px system-ui'; ctx.fillText('What happened', X, y); y += 44;
+  ctx.font = '24px system-ui';
+  for (const ev of S.fired) {
+    const before = avgLevel(Math.max(GRACE, ev.t - 12), ev.t);
+    const after = avgLevel(ev.t, ev.t + 12);
+    const def = EVENTS[ev.key];
+    const c = S.counsel.find((x) => x.key === ev.key);
+    ctx.fillStyle = '#f2c14e';
+    ctx.fillText(`Hour ${ev.t.toFixed(0)}: ${def.short} ${c ? (c.correct ? '✓' : '✗') : ''}`, X, y); y += 32;
+    ctx.fillStyle = '#cfdbe5';
+    const change = def.clMult === 1 ? 'No PK change.' : `Clearance ${def.clMult > 1 ? 'rose' : 'fell'} ${Math.round(Math.abs(def.clMult - 1) * 100)}%.`;
+    y = para(ctx, `${change} Avg level 12 h before: ${before.toFixed(1)}, after: ${after.toFixed(1)} mg/L.`, X, y, MW, 30) + 14;
+  }
+  const r = suggestedRegimen();
+  ctx.fillStyle = '#e6f0f7'; ctx.font = 'bold 30px system-ui'; ctx.fillText('Problem-solving check', X, y + 10); y += 52;
+  ctx.fillStyle = '#cfdbe5'; ctx.font = '24px system-ui';
+  y = para(ctx, `Final clearance ${CL().toFixed(2)} L/h, t½ ≈ ${halfLife().toFixed(1)} h. Using Css,avg = Dose ÷ (CL × τ), about ${r.dose} mg every ${r.tau} h would average ${r.avg.toFixed(1)} mg/L.`, X, y, MW, 30);
+}
+
+function drawDebrief2(ctx, W, H) {
+  bg(ctx, W, H);
+  ctx.textAlign = 'left'; ctx.fillStyle = '#e6f0f7'; ctx.font = 'bold 44px system-ui';
+  ctx.fillText('Teaching points', 50, 70);
+  let y = 125;
+  ctx.font = '27px system-ui'; ctx.fillStyle = '#cfdbe5';
+  for (const k of KEY_POINTS) y = para(ctx, '• ' + k, 50, y, 760, 36) + 8;
+
+  let y2 = 125; const X = 850, MW = W - X - 50;
+  ctx.fillStyle = '#f2c14e'; ctx.font = 'bold 30px system-ui';
+  ctx.fillText('Your counseling review', X, y2); y2 += 44;
+  for (const c of S.counsel) {
+    const ev = EVENTS[c.key];
+    ctx.fillStyle = c.correct ? '#6fd69a' : '#ff8a8a'; ctx.font = 'bold 26px system-ui';
+    ctx.fillText(`${c.correct ? '✓' : '✗'} ${ev.short} (${c.seconds}s)`, X, y2); y2 += 34;
+    ctx.fillStyle = '#cfdbe5'; ctx.font = '23px system-ui';
+    y2 = para(ctx, ev.teach, X, y2, MW, 30) + 14;
+  }
+  ctx.fillStyle = '#8fa6b8'; ctx.font = '22px system-ui';
+  ctx.fillText('Simplified, theophylline-like model for education. Not for clinical dosing.', 50, py(-0.32));
+}
+
+// ----------------------------------------------------------- side panels
+function drawStatus(ctx, W, H) {
+  bg(ctx, W, H);
+  ctx.textAlign = 'left';
+  if (!S.profile) {
+    ctx.fillStyle = '#8fa6b8'; ctx.font = '30px system-ui';
+    ctx.fillText('Choose a patient to begin.', 36, 70);
+    return;
+  }
+  const c = conc(), z = zone(c);
+  ctx.fillStyle = '#8fa6b8'; ctx.font = '26px system-ui';
+  ctx.fillText(`Hour ${S.t.toFixed(1)} / ${SIM_HOURS}`, 36, 52);
+  ctx.fillStyle = z.color; ctx.font = 'bold 84px system-ui';
+  const num = c.toFixed(1); ctx.fillText(num, 36, 145);
+  const nw = ctx.measureText(num).width;
+  ctx.font = '30px system-ui'; ctx.fillText(`mg/L  ${z.name}`, 36 + nw + 16, 145);
+  ctx.fillStyle = '#e6f0f7'; ctx.font = '26px system-ui';
+  ctx.fillText(`Time in target: ${pctTarget().toFixed(0)}%`, 36, 200);
+  const right = S.counsel.filter((x) => x.correct).length;
+  ctx.fillText(`Counseling: ${right}/${S.counsel.length}`, 36, 238);
+  const wait = Math.max(0, MIN_INTERVAL - (S.t - S.lastDose));
+  ctx.fillText(wait > 0 ? `Next dose in ${wait.toFixed(1)} h` : 'Dose available', 36, 276);
+  ctx.fillStyle = '#8fa6b8';
+  ctx.fillText(`CL ${CL().toFixed(2)} L/h · t½ ${halfLife().toFixed(1)} h`, 36, 314);
+  ctx.fillStyle = '#f2c14e'; ctx.font = '25px system-ui';
+  para(ctx, S.msg, 36, 380, W - 72, 34);
+}
+
+function drawTag(ctx, W, H) {
+  bg(ctx, W, H);
+  ctx.textAlign = 'center'; ctx.fillStyle = '#e6f0f7'; ctx.font = 'bold 38px system-ui';
+  ctx.fillText(S.profile ? S.profile.name : 'Patient', W / 2, 58);
+  ctx.fillStyle = '#8fa6b8'; ctx.font = '24px system-ui';
+  ctx.fillText(S.profile ? S.profile.sub : 'Theophylline PO', W / 2, 100);
+}
+
+// ----------------------------------------------------------- main component
+AFRAME.registerComponent('game', {
+  init() {
+    const go = () => { setupScene(this.el); toMenu(); };
+    this.el.hasLoaded ? go() : this.el.addEventListener('loaded', go);
+    this.acc = 0;
+    this.tmp = new THREE.Color();
+    this.wasPlaying = false;
+    window.addEventListener('keydown', onKey);
+  },
+  tick(time, delta) {
+    if (!patientEl) return;
+    const dt = Math.min(delta / 1000, 0.1);
+    update(dt);
+
+    const c = conc();
+    this.tmp.set(zone(c).color);
+    patientEl.querySelectorAll('a-cylinder, a-sphere:not(:last-child)').forEach((e) => {
+      const m = e.getObject3D('mesh'); if (m) m.material.color.lerp(this.tmp, 0.08);
+    });
+    const shake = c > TOXIC ? Math.min(0.03, (c - TOXIC) * 0.004) : 0;
+    patientEl.object3D.position.x = -1.65 + Math.sin(time * 0.06) * shake;
+
+    this.acc += dt;
+    if (this.acc > 0.05) {
+      this.acc = 0;
+      if (S.mode === 'play' || this.wasPlaying) {
+        redraw(graphEl); redraw(statusEl); doseBtns.forEach(redraw);
+      }
+      this.wasPlaying = S.mode === 'play';
+    }
+  },
+});
+
+function onKey(e) {
+  const n = Number(e.key);
+  if (S.mode === 'menu' && n >= 1 && n <= 4) startGame(PROFILES[n - 1]);
+  else if (S.mode === 'play' && n >= 1 && n <= 3) giveDose(S.profile.doses[n - 1]);
+  else if (S.mode === 'play' && e.key === 'Escape') toMenu();
+  else if (S.mode === 'counsel' && S.current.chosen === null && n >= 1 && n <= 3) choose(n - 1);
+  else if (S.mode === 'counsel' && S.current.chosen !== null && (e.key === 'Enter' || e.key === ' ')) resume();
+  else if (S.mode === 'debrief' && e.key === 'Enter') toMenu();
+  else if (S.mode === 'debrief' && (e.key === 'ArrowRight' || e.key === 'ArrowLeft')) { S.page = S.page === 1 ? 2 : 1; showDebrief(); }
+  if (S.mode !== 'menu' && S.mode !== 'debrief') { redraw(statusEl); redraw(graphEl); }
+}
+</script>
+</body>
+</html>
